@@ -224,6 +224,35 @@ describe("outbox: never lose, never duplicate (PROTOCOL.md §6)", () => {
     expect(o.nextSeq(junk)).toBe(0);
   });
 
+  it("recovers the last seq from a multi-MB outbox in O(1) tail reads, across chunk and UTF-8 boundaries", () => {
+    const o = new Outbox(tmp);
+    const big = { harness: "codex", session: "multi-mb-seq" };
+    mkdirSync(o.dir("codex"), { recursive: true });
+    const row = JSON.stringify({ ...ev(0), data: { text: `café-${"x".repeat(380)}` } });
+    // ~4.5 MiB of JSONL (10,000 events), followed by a final event with multi-byte UTF-8 and trailing corrupt lines
+    const block = `${Array.from({ length: 500 }, () => row).join("\n")}\n`;
+    for (let i = 0; i < 20; i++) appendFileSync(o.file(big), block);
+    o.append(big, [{ ...ev(9999), data: { text: "🎉".repeat(2500) } }]);
+    appendFileSync(o.file(big), '{"not":"an-event"}\npartial-trailing-write');
+    expect(statSync(o.file(big)).size).toBeGreaterThan(4 * 1024 * 1024);
+
+    const t0 = performance.now();
+    expect(o.nextSeq(big)).toBe(10_000);
+    expect(performance.now() - t0).toBeLessThan(50);
+
+    // Also handles empty file, CRLF/whitespace-padded lines, and >16 KiB single-line events across chunks
+    const empty = { harness: "codex", session: "empty-seq" };
+    writeFileSync(o.file(empty), "");
+    expect(o.nextSeq(empty)).toBe(0);
+
+    const single = { harness: "codex", session: "no-nl" };
+    writeFileSync(o.file(single), `  ${JSON.stringify({ ...ev(41), data: { big: "z".repeat(20_000) } })}  \r\n  `);
+    expect(o.nextSeq(single)).toBe(42);
+    const noNl = { harness: "codex", session: "bare-single" };
+    writeFileSync(o.file(noNl), JSON.stringify(ev(11)));
+    expect(o.nextSeq(noNl)).toBe(12);
+  });
+
   it("a truncated trailing line is left for the next read; a corrupt whole line is skipped", () => {
     const o = new Outbox(tmp);
     o.append(ref, [ev(0)]);

@@ -16,7 +16,7 @@ import { userInfo } from "node:os";
 import path from "node:path";
 import { deliveredWords } from "../control/frames.js";
 import { homeDir } from "../paths.js";
-import { ends, parseLines, recentFiles, scanLines } from "../readers/files.js";
+import { ends, parseLines, readTranscriptLines, recentFiles, scanLines } from "../readers/files.js";
 import { gitFacts } from "../readers/git.js";
 import { isInjected, readClaude } from "../readers/transcripts.js";
 import type { DataOf, HarnessAccount } from "../types.js";
@@ -334,13 +334,9 @@ export const claudeCode: Adapter = {
   },
 
   readTranscript(file, fromLine) {
-    let text = "";
-    try {
-      text = readFileSync(file, "utf8");
-    } catch {
-      return { turns: [], line: fromLine };
-    }
-    return readClaude(text.split("\n"), fromLine);
+    const lines = readTranscriptLines(file);
+    if (!lines) return { turns: [], line: fromLine };
+    return readClaude(lines, fromLine);
   },
 
   facts(session, transcript, hints, state): SessionFacts {

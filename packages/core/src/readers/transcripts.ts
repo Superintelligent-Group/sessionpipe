@@ -321,13 +321,51 @@ export function codexInjected(text: string): boolean {
   return /^<[a-z_-]+>/i.test(text) || /^# AGENTS\.md instructions\b/i.test(text);
 }
 
+interface CodexBoundaryState {
+  headerIndex: number;
+  headerRaw: string;
+  boundary: ((record: Record<string, unknown> | null) => boolean) | undefined;
+  start: number;
+  scannedTo: number;
+}
+const codexBoundaryCache = new WeakMap<string[], CodexBoundaryState>();
+
+function resolveCodexStart(lines: string[]): number {
+  const cached = codexBoundaryCache.get(lines);
+  if (cached && cached.headerIndex < lines.length && lines[cached.headerIndex] === cached.headerRaw) {
+    if (!cached.boundary) return 0;
+    if (cached.start >= 0) return cached.start;
+    for (let i = Math.max(0, cached.scannedTo - 1); i < lines.length; i++) {
+      if (cached.boundary(parse(lines[i] as string))) {
+        cached.start = i;
+        cached.scannedTo = Math.max(0, lines.length - 1);
+        return i;
+      }
+    }
+    cached.scannedTo = Math.max(0, lines.length - 1);
+    return -1;
+  }
+  const headerIndex = lines.findIndex((line) => line.trim());
+  if (headerIndex < 0) return 0;
+  const headerRaw = lines[headerIndex] as string;
+  const boundary = codexReplayBoundary(parse(headerRaw));
+  const start = boundary ? lines.findIndex((line) => boundary(parse(line))) : 0;
+  codexBoundaryCache.set(lines, {
+    headerIndex,
+    headerRaw,
+    boundary,
+    start,
+    scannedTo: Math.max(0, lines.length - 1),
+  });
+  return start;
+}
+
 /** Codex rollout: {type:"response_item", payload:{type:"message", role, content:[{type:"input_text"|"output_text", text}]}}. */
 export function readCodex(lines: string[], from: number): TranscriptRead {
   const msgs: Msg[] = [];
-  const boundary = codexReplayBoundary(parse(lines.find((line) => line.trim()) ?? ""));
   // Find the boundary from the header even when resuming inside the replay.
   // Keep absolute line numbers: the delivery cursor refers to the original file.
-  const start = boundary ? lines.findIndex((line) => boundary(parse(line))) : 0;
+  const start = resolveCodexStart(lines);
   if (start < 0) return pairTurns(msgs, endOf(lines));
   for (let i = Math.max(from, start); i < lines.length; i++) {
     const j = lines[i] ? parse(lines[i] as string) : null;

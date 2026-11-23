@@ -7,7 +7,7 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { homeDir } from "../paths.js";
-import { ends, parseLines, recentFiles, scanLines } from "../readers/files.js";
+import { ends, parseLines, readTranscriptLines, recentFiles, scanLines } from "../readers/files.js";
 import { codexInjected, readCodex } from "../readers/transcripts.js";
 import type { DataOf } from "../types.js";
 import { installClaudeShaped, installedClaudeShaped, uninstallClaudeShaped, writeBack } from "./claude-shaped.js";
@@ -374,13 +374,9 @@ export const codex: Adapter = {
   },
 
   readTranscript(file, fromLine) {
-    let text = "";
-    try {
-      text = readFileSync(file, "utf8");
-    } catch {
-      return { turns: [], line: fromLine };
-    }
-    return readCodex(text.split("\n"), fromLine);
+    const lines = readTranscriptLines(file);
+    if (!lines) return { turns: [], line: fromLine };
+    return readCodex(lines, fromLine);
   },
 
   facts(session, transcript): SessionFacts {

@@ -94,3 +94,146 @@ export function recentFiles(root: string, depth: number, sinceMs: number, match:
   walk(root, 0);
   return out;
 }
+
+const GUARD_BYTES = 64;
+const TAIL_READ_CHUNK = 256 * 1024;
+const MAX_TAIL_CACHE_FILES = 32;
+const EMPTY_BUF = Buffer.alloc(0);
+
+interface TailCacheEntry {
+  dev: number;
+  ino: number;
+  /** Byte offset immediately after the last committed `\n` (`0x0a`) in `lines`. */
+  byteOffset: number;
+  /** Number of committed newline-terminated lines in `lines` (`0 .. completeCount - 1`). */
+  completeCount: number;
+  /** Equivalent to `readFileSync(file, "utf8").split("\n")`: committed lines + 1 trailing element. */
+  lines: string[];
+  /** Prefix guard bytes `[0 .. min(GUARD_BYTES, byteOffset))` to detect in-place overwrites on the same inode. */
+  headGuard: Buffer;
+  /** Suffix guard bytes `[byteOffset - min(GUARD_BYTES, byteOffset) .. byteOffset)` to detect rewrites. */
+  tailGuard: Buffer;
+}
+
+function readSlice(fd: number, pos: number, len: number): Buffer {
+  const buf = Buffer.allocUnsafe(len);
+  return buf.subarray(0, readSync(fd, buf, 0, len, pos));
+}
+
+/** Incremental `(filePath, dev, ino, byteOffset)` JSONL line reader. Repeated reads of
+ *  the same growing transcript during settle polling read only newly appended bytes from
+ *  `byteOffset` while resetting cleanly to byte 0 on truncation, inode rotation, or
+ *  in-place file rewrite. */
+export class TranscriptTailReader {
+  private readonly cache = new Map<string, TailCacheEntry>();
+
+  constructor(private readonly maxFiles = MAX_TAIL_CACHE_FILES) {}
+
+  clear(): void {
+    this.cache.clear();
+  }
+
+  read(file: string): string[] | null {
+    let fd: number | undefined;
+    try {
+      fd = openSync(file, "r");
+      const st = fstatSync(fd);
+      if (!st.isFile()) {
+        this.cache.delete(file);
+        return null;
+      }
+      const size = st.size;
+      let entry = this.cache.get(file);
+      if (entry) {
+        const sameIdentity = entry.dev === st.dev && entry.ino === st.ino && size >= entry.byteOffset;
+        let guardsMatch = sameIdentity;
+        if (guardsMatch && entry.byteOffset > 0) {
+          guardsMatch = readSlice(fd, 0, entry.headGuard.length).equals(entry.headGuard);
+          if (guardsMatch && entry.byteOffset > entry.headGuard.length) {
+            guardsMatch = readSlice(fd, entry.byteOffset - entry.tailGuard.length, entry.tailGuard.length).equals(
+              entry.tailGuard,
+            );
+          }
+        }
+        if (!guardsMatch) entry = undefined;
+      }
+      if (!entry) {
+        entry = {
+          dev: st.dev,
+          ino: st.ino,
+          byteOffset: 0,
+          completeCount: 0,
+          lines: [""],
+          headGuard: EMPTY_BUF,
+          tailGuard: EMPTY_BUF,
+        };
+      }
+      if (size === 0 || size === entry.byteOffset) {
+        entry.lines.length = entry.completeCount;
+        entry.lines.push("");
+        this.touch(file, entry);
+        return entry.lines;
+      }
+
+      const prevByteOffset = entry.byteOffset;
+      entry.lines.length = entry.completeCount;
+      let pos = entry.byteOffset;
+      const chunkBuf = Buffer.allocUnsafe(Math.min(TAIL_READ_CHUNK, size - pos));
+      let rem: Buffer = EMPTY_BUF;
+      while (true) {
+        const n = readSync(fd, chunkBuf, 0, chunkBuf.length, pos);
+        if (!n) break;
+        const sub = chunkBuf.subarray(0, n);
+        let start = 0;
+        while (true) {
+          const nl = sub.indexOf(0x0a, start);
+          if (nl < 0) break;
+          const part = sub.subarray(start, nl);
+          const line = rem.length ? Buffer.concat([rem, part]).toString("utf8") : sub.toString("utf8", start, nl);
+          rem = EMPTY_BUF;
+          entry.lines.push(line);
+          entry.completeCount++;
+          entry.byteOffset = pos + nl + 1;
+          start = nl + 1;
+        }
+        if (start < sub.length) {
+          const tail = sub.subarray(start);
+          rem = rem.length ? Buffer.concat([rem, tail]) : Buffer.from(tail);
+        }
+        pos += n;
+      }
+      if (entry.byteOffset > prevByteOffset) {
+        const headWant = Math.min(GUARD_BYTES, entry.byteOffset);
+        if (entry.headGuard.length < headWant) entry.headGuard = readSlice(fd, 0, headWant);
+        const tailWant = Math.min(GUARD_BYTES, entry.byteOffset);
+        entry.tailGuard = readSlice(fd, entry.byteOffset - tailWant, tailWant);
+      }
+      entry.lines.push(rem.length ? rem.toString("utf8") : "");
+      this.touch(file, entry);
+      return entry.lines;
+    } catch {
+      this.cache.delete(file);
+      return null;
+    } finally {
+      if (fd !== undefined)
+        try {
+          closeSync(fd);
+        } catch {}
+    }
+  }
+
+  private touch(file: string, entry: TailCacheEntry): void {
+    this.cache.delete(file);
+    this.cache.set(file, entry);
+    while (this.cache.size > this.maxFiles) {
+      this.cache.delete(this.cache.keys().next().value as string);
+    }
+  }
+}
+
+const defaultTailReader = new TranscriptTailReader();
+
+/** Read a JSONL transcript file into lines incrementally from the cached byte cursor. */
+export function readTranscriptLines(file: string): string[] | null {
+  return defaultTailReader.read(file);
+}
