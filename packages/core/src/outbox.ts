@@ -9,6 +9,7 @@ import {
   appendFileSync,
   closeSync,
   existsSync,
+  fstatSync,
   mkdirSync,
   openSync,
   readdirSync,
@@ -30,6 +31,20 @@ export interface OutboxRef {
 
 const READ_CHUNK = 1024 * 1024;
 const READ_MAX = 8 * 1024 * 1024;
+const TAIL_CHUNK = 8 * 1024;
+
+function parseSeqBytes(buf: Buffer, start: number, end: number): number {
+  let lo = start;
+  let hi = end;
+  while (lo < hi && buf[lo]! <= 0x20) lo++;
+  while (hi > lo && buf[hi - 1]! <= 0x20) hi--;
+  if (lo >= hi) return -1;
+  try {
+    const j = JSON.parse(buf.toString("utf8", lo, hi)) as Partial<Event> | null;
+    if (j && typeof j === "object" && typeof j.session?.seq === "number") return j.session.seq;
+  } catch {}
+  return -1;
+}
 
 export class Outbox {
   constructor(readonly root: string) {}
@@ -63,15 +78,46 @@ export class Outbox {
 
   private lastSeqInFile(ref: OutboxRef): number {
     const f = this.file(ref);
-    if (!existsSync(f)) return -1;
-    const lines = readFileSync(f, "utf8").trim().split("\n");
-    for (let i = lines.length - 1; i >= 0; i--) {
-      try {
-        const j = JSON.parse(lines[i] as string) as Event;
-        if (typeof j.session?.seq === "number") return j.session.seq;
-      } catch {}
+    let fd: number;
+    try {
+      fd = openSync(f, "r");
+    } catch {
+      return -1;
     }
-    return -1;
+    try {
+      const size = fstatSync(fd).size;
+      if (size <= 0) return -1;
+      const buf = Buffer.allocUnsafe(Math.min(TAIL_CHUNK, size));
+      let pos = size;
+      let carry: Buffer = Buffer.alloc(0);
+      while (pos > 0) {
+        const step = Math.min(TAIL_CHUNK, pos);
+        pos -= step;
+        const data = buf.subarray(0, readSync(fd, buf, 0, step, pos));
+        const lastNl = data.lastIndexOf(0x0a);
+        if (lastNl < 0) {
+          carry = carry.length ? Buffer.concat([data, carry]) : Buffer.from(data);
+          continue;
+        }
+        const tailPart = data.subarray(lastNl + 1);
+        const joined = carry.length ? Buffer.concat([tailPart, carry]) : tailPart;
+        carry = Buffer.alloc(0);
+        const tailSeq = parseSeqBytes(joined, 0, joined.length);
+        if (tailSeq >= 0) return tailSeq;
+        let right = lastNl;
+        while (right > 0) {
+          const nl = data.lastIndexOf(0x0a, right - 1);
+          if (nl < 0) break;
+          const seq = parseSeqBytes(data, nl + 1, right);
+          if (seq >= 0) return seq;
+          right = nl;
+        }
+        carry = Buffer.from(data.subarray(0, right));
+      }
+      return parseSeqBytes(carry, 0, carry.length);
+    } finally {
+      closeSync(fd);
+    }
   }
 
   append(ref: OutboxRef, events: Event[]): void {

@@ -164,6 +164,24 @@ describe("a forked Codex subagent rollout", () => {
       last_at: Date.parse("2026-10-09T23:47:06.489Z"),
     });
     expect(readCodex(FORK, 37)).toEqual({ turns: CHILD_TURNS, line: 46 });
+
+    // Incremental file tailing across replay -> boundary -> child reply reuses cached boundary state
+    const growing = rolloutFile(FORK.slice(0, 36));
+    expect(codex.readTranscript!(growing, 0)).toEqual({ turns: [], line: 36 });
+    writeFileSync(growing, `${FORK.slice(0, 37).join("\n")}\n`);
+    expect(codex.readTranscript!(growing, 0)).toEqual({ turns: [], line: 37 });
+    writeFileSync(growing, `${FORK.join("\n")}\n`);
+    expect(codex.readTranscript!(growing, 0)).toEqual({ turns: CHILD_TURNS, line: 46 });
+    expect(codex.readTranscript!(growing, 46)).toEqual({ turns: [], line: 46 });
+
+    // Non-forked rollout incremental tailing reuses cached header state
+    const plain = rolloutFile(ROLLOUT.slice(0, 4));
+    expect(codex.readTranscript!(plain, 0).open?.user).toBe("what folder are you in?");
+    writeFileSync(plain, `${ROLLOUT.join("\n")}\n`);
+    expect(codex.readTranscript!(plain, 0)).toEqual({
+      turns: [{ user: "what folder are you in?", assistant: "/workspace", at: 1791115200000, endLine: 4 }],
+      line: 5,
+    });
   });
 
   it("keeps a later real child ask and holds the cursor until its reply arrives", () => {

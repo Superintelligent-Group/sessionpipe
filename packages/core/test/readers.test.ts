@@ -3,11 +3,29 @@
 // files under a root) and the git facts of a folder with its remote's credentials
 // stripped.
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { ends, parseLines, recentFiles, scanLines } from "../src/readers/files.js";
+import {
+  ends,
+  parseLines,
+  readTranscriptLines,
+  recentFiles,
+  scanLines,
+  TranscriptTailReader,
+} from "../src/readers/files.js";
 import { gitFacts, stripCredentials } from "../src/readers/git.js";
 
 const dirs: string[] = [];
@@ -80,6 +98,88 @@ describe("scanLines", () => {
   });
   it("a missing file is null", () => {
     expect(scanLines(path.join(fresh(), "none"), () => 1)).toBeNull();
+  });
+});
+
+describe("TranscriptTailReader", () => {
+  it("tails growing JSONL files incrementally and handles partial lines, split UTF-8, truncation, rotation, and rewrites", () => {
+    const dir = fresh();
+    const file = path.join(dir, "transcript.jsonl");
+    const reader = new TranscriptTailReader(4);
+    const exact = () => readFileSync(file, "utf8").split("\n");
+
+    expect(reader.read(file)).toBeNull();
+    expect(readTranscriptLines(path.join(dir, "missing.jsonl"))).toBeNull();
+    expect(reader.read(dir)).toBeNull();
+
+    // Empty file
+    writeFileSync(file, "");
+    expect(reader.read(file)).toEqual([""]);
+    expect(reader.read(file)).toEqual(exact());
+
+    // Initial lines + unchanged settle polls
+    writeFileSync(file, '{"seq":0}\n{"seq":1}\n');
+    expect(reader.read(file)).toEqual(exact());
+    expect(reader.read(file)).toEqual(exact());
+
+    // Partial trailing line with a multi-byte UTF-8 character cut mid-codepoint
+    const utf8Line = Buffer.from('{"text":"café 🚀 done"}\n', "utf8");
+    const cutAt = utf8Line.indexOf(0xf0) + 2; // inside the 4-byte 🚀 sequence
+    appendFileSync(file, utf8Line.subarray(0, cutAt));
+    expect(reader.read(file)).toEqual(exact());
+    expect(reader.read(file)).toEqual(exact()); // repeated poll while still partial
+
+    // Remainder of the torn UTF-8 line arrives
+    appendFileSync(file, utf8Line.subarray(cutAt));
+    expect(reader.read(file)).toEqual(exact());
+    expect(reader.read(file)?.[2]).toBe('{"text":"café 🚀 done"}');
+
+    // Grow past GUARD_BYTES (64B) and past TAIL_READ_CHUNK (256 KiB) across chunk boundaries
+    const longLine = `{"huge":"${"a".repeat(600_000)}"}`;
+    appendFileSync(file, longLine.slice(0, 550_000));
+    expect(reader.read(file)).toEqual(exact());
+    appendFileSync(file, `${longLine.slice(550_000)}\n`);
+    expect(reader.read(file)).toEqual(exact());
+    expect(reader.read(file)).toEqual(exact()); // hits both headGuard and tailGuard (>64B) when unchanged
+
+    // Same-prefix (>64B) rewrite with modified tail triggers tailGuard invalidation
+    const current = readFileSync(file, "utf8");
+    writeFileSync(file, `${current.slice(0, 120)}{"rewritten_tail":true}\n`);
+    expect(reader.read(file)).toEqual(exact());
+
+    // Truncation resets to byte 0
+    writeFileSync(file, '{"after":"truncate"}\n');
+    expect(reader.read(file)).toEqual(exact());
+
+    // In-place overwrite on same inode with larger size resets via guard bytes
+    writeFileSync(file, '{"rewritten":true,"padding":"xxxxxxxxxxxxxxxxxxxxxxxxxxxx"}\n{"second":2}\n');
+    expect(reader.read(file)).toEqual(exact());
+
+    // Inode rotation (unlink + recreate / atomic rename) resets to byte 0
+    const nextFile = path.join(dir, "rotated.jsonl");
+    writeFileSync(nextFile, '{"rotated":1}\n{"rotated":2}\n{"rotated":3}\n');
+    unlinkSync(file);
+    renameSync(nextFile, file);
+    expect(reader.read(file)).toEqual(exact());
+
+    // Deletion clears cache entry cleanly
+    unlinkSync(file);
+    expect(reader.read(file)).toBeNull();
+  });
+
+  it("evicts oldest cached files beyond maxFiles and clear() resets state", () => {
+    const dir = fresh();
+    const reader = new TranscriptTailReader(2);
+    const files = [0, 1, 2].map((i) => {
+      const f = path.join(dir, `f${i}.jsonl`);
+      writeFileSync(f, `{"i":${i}}\n`);
+      return f;
+    });
+    for (const f of files) expect(reader.read(f)).toEqual(readFileSync(f, "utf8").split("\n"));
+    appendFileSync(files[0]!, '{"more":true}\n');
+    expect(reader.read(files[0]!)).toEqual(readFileSync(files[0]!, "utf8").split("\n"));
+    reader.clear();
+    expect(reader.read(files[1]!)).toEqual(readFileSync(files[1]!, "utf8").split("\n"));
   });
 });
 

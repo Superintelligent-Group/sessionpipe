@@ -14,7 +14,7 @@
 import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import { homeDir } from "../paths.js";
-import { ends, parseLines } from "../readers/files.js";
+import { ends, parseLines, readTranscriptLines } from "../readers/files.js";
 import { readAntigravity } from "../readers/transcripts.js";
 import { formatJson, readJsonFile, removeEmptied, writeBack } from "./claude-shaped.js";
 import type {
@@ -156,13 +156,9 @@ export const antigravity: Adapter = {
   },
 
   readTranscript(file, fromLine) {
-    let text = "";
-    try {
-      text = readFileSync(file, "utf8");
-    } catch {
-      return { turns: [], line: fromLine };
-    }
-    return readAntigravity(text.split("\n"), fromLine);
+    const lines = readTranscriptLines(file);
+    if (!lines) return { turns: [], line: fromLine };
+    return readAntigravity(lines, fromLine);
   },
 
   facts(session, transcript, hints): SessionFacts {

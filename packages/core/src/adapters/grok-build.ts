@@ -17,9 +17,10 @@
 //
 // stdout stays empty for every event: Grok reads a decision from a blocking hook's
 // stdout, and silence with exit 0 is "carry on".
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { homeDir } from "../paths.js";
+import { readTranscriptLines } from "../readers/files.js";
 import { readGrok } from "../readers/transcripts.js";
 import { installClaudeShaped, installedClaudeShaped, readJson, uninstallClaudeShaped } from "./claude-shaped.js";
 import type { Adapter, BackfillRow, HookInput, HookResult, InstallOptions, SessionFacts } from "./types.js";
@@ -195,13 +196,9 @@ export const grokBuild: Adapter = {
   },
 
   readTranscript(file, fromLine) {
-    let text = "";
-    try {
-      text = readFileSync(file, "utf8");
-    } catch {
-      return { turns: [], line: fromLine };
-    }
-    return readGrok(text.split("\n"), fromLine);
+    const lines = readTranscriptLines(file);
+    if (!lines) return { turns: [], line: fromLine };
+    return readGrok(lines, fromLine);
   },
 
   facts(session, transcript, _hints, _state, env = process.env): SessionFacts {

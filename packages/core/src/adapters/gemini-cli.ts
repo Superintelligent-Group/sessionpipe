@@ -4,10 +4,10 @@
 // Code but timeouts in MILLISECONDS and a `name` per handler. stdout must be JSON or
 // empty. Its own telemetry defaults logPrompts on; the installer says so once.
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { homeDir } from "../paths.js";
-import { ends, parseLines } from "../readers/files.js";
+import { ends, parseLines, readTranscriptLines } from "../readers/files.js";
 import { readGemini } from "../readers/transcripts.js";
 import { installClaudeShaped, installedClaudeShaped, readJson, uninstallClaudeShaped } from "./claude-shaped.js";
 import { findBinary, probe } from "./headless.js";
@@ -186,13 +186,9 @@ export const geminiCli: Adapter = {
   },
 
   readTranscript(file, fromLine) {
-    let text = "";
-    try {
-      text = readFileSync(file, "utf8");
-    } catch {
-      return { turns: [], line: fromLine };
-    }
-    return readGemini(text.split("\n"), fromLine);
+    const lines = readTranscriptLines(file);
+    if (!lines) return { turns: [], line: fromLine };
+    return readGemini(lines, fromLine);
   },
 
   facts(_session, transcript): SessionFacts {
